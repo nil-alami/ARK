@@ -1,0 +1,16 @@
+.data/
+.vendor/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+/.codex_tmp/
+/.codex/
+/.idea/inspectionProfiles/profiles_settings.xml
+/.idea/inspectionProfiles/Project_Default.xml
+/.idea/.gitignore
+/.idea/ARK-system-design-codex.iml
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/vcs.xml

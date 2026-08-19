@@ -1,0 +1,16 @@
+id: module-id
+name: Human-readable module name
+kind: platform
+parent: platform
+tenant_scope: none
+pattern: pattern-id
+identity: MODULE.md
+status: proposed
+
+provides_contracts: []
+depends_on: []
+owns_data: []
+emits: []
+consumes: []
+related_adrs: []
+

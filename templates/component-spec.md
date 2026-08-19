@@ -1,0 +1,21 @@
+# Component specification — NAME
+
+- Classification: `required now | useful soon | scale-triggered | optional | unjustified`
+- Requirement(s):
+- Responsibility and non-responsibilities:
+- Stages/workflows where used:
+- Trigger and prerequisites:
+- Inputs/outputs and contract versions:
+- State and authoritative storage owner:
+- Upstream/downstream dependencies:
+- Critical-path or supporting-path role:
+- Failure effect and user-visible status:
+- Timeout/retry/idempotency/cancellation:
+- Security and tenant-isolation controls:
+- Observability and audit:
+- Scaling/resource isolation:
+- Simplest viable implementation:
+- Alternative considered and rejection reason:
+- Operational burden and owner:
+- Reconsideration/extraction trigger:
+- Effect if removed, moved, delayed, or replaced:
