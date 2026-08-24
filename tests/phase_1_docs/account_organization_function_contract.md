@@ -9,11 +9,15 @@ function names, inputs, expected outputs, authorization, state effects, and erro
 codes. It contains no implementation bodies and does not prescribe controllers,
 HTTP routes, frameworks, or database repositories.
 
+Account registration evidence is recorded in
+`sources/sponsor-decisions/2026-08-23-account-registration-redesign-implementation.md`
+and `sources/sponsor-decisions/2026-08-23-account-otp-concurrency-hardening.md`.
+
 ## Function catalog
 
 | Domain | Functions |
 |---|---|
-| User/authentication | `register_user`, `login_user`, `refresh_session`, `logout_user`, `logout_all_sessions`, `request_user_verification`, `confirm_user_verification`, `edit_user`, `get_user`, `delete_user` |
+| User/authentication | `register_user`, `resend_registration_otp`, `confirm_registration`, `change_password`, `login_user`, `refresh_session`, `logout_user`, `logout_all_sessions`, `request_user_verification`, `confirm_user_verification`, `edit_user`, `get_user`, `delete_user` |
 | Organization | `add_organization`, `edit_organization`, `get_organization`, `list_organizations`, `suspend_organization`, `reactivate_organization`, `delete_organization`, `get_organization_capability_pattern`, `update_organization_capability_pattern` |
 | Member/API key | `add_member`, `edit_member`, `get_member`, `list_members`, `suspend_member`, `reactivate_member`, `remove_member`, `get_member_api_key`, `rotate_member_api_key`, `revoke_member_api_key` |
 | Role/Permission | `list_roles`, `get_role`, `list_permissions`, `get_permission` |
@@ -71,6 +75,24 @@ HTTP routes, frameworks, or database repositories.
     logged or returned again.
 15. A high-impact mutation fails closed if mandatory audit persistence is
     unavailable.
+16. Account (formerly named IAM) owns authoritative pending-registration state.
+    Registration creates no User until OTP confirmation succeeds; the client may
+    retain only the opaque tab-scoped registration-session ID.
+17. Registration OTP consumption, User activation, phone verification,
+    registration completion, and first-session issuance are one transaction.
+18. A User created by registration has `password_hash = NULL`; password setup or
+    change is a separate authenticated operation. Normal profile editing cannot
+    mutate phone.
+19. OTP replacement and attempt accounting are database-race-safe. Challenge
+    creation serializes its phone/purpose scope, invalidates every prior live
+    challenge before replacement, and atomically reserves attempts only while the
+    challenge is unconsumed, not invalidated, unexpired, and below its limit.
+20. Persisted OTP digests are HMAC-SHA-256 outputs and MUST be exactly 32 bytes;
+    database integrity constraints enforce that length.
+21. Physical PostgreSQL identifiers use lowercase snake_case. Logical contract
+    types such as `UserId` remain type names, not database-column spellings.
+    Existing quoted PascalCase identifiers are a legacy implementation gap until
+    a coordinated forward migration completes.
 
 ## 3. Function notation
 
@@ -339,6 +361,18 @@ Businesses belonging to the trusted Organization context. Permission codes never
 carry or imply a selected-Business allowlist.
 
 ## 6. User and authentication functions
+the Account Module:
+```text
+User
+ |
+ +-- Member
+      |
+      +-- Organization
+             |
+             +-- Roles / Capabilities
+
+API Keys belong to Members
+```
 
 ### 6.1 `register_user`
 
@@ -349,22 +383,98 @@ Authorization: anonymous registration policy or trusted administrative bootstrap
 | Input field | Type | Required | Validation |
 |---|---|---:|---|
 | `full_name` | `string` | Yes | Trimmed length 1–200 |
-| `phone` | `string` | Yes | E.164 format |
+| `phone` | `string` | Yes | Normalizes to Iranian `09xxxxxxxxx` form |
 | `email` | `string` | No | Normalized valid address, maximum 320 |
 | `city_id` | `string` | No | Approved city code |
 | `terms_version` | `string` | Policy-dependent | Must equal an accepted active version |
+| `registration_type` | `NEW_OWNER \| INVITED_MEMBER` | Yes | Allowed registration type |
+| `invitation_token` | `SecretOnce?` | For invited-member flow | Validated input; fails closed until Organization exposes its invitation boundary |
 
 | Output field | Type | Contract |
 |---|---|---|
-| `user` | `UserView` | New `ACTIVE` User |
-| `verification_required` | `boolean` | Whether confirmation is required before login or organization creation |
-| `allowed_verification_channels` | `string[]` | Channels supported by the active trust profile |
+| `registration_session_id` | `RegistrationSessionId` | Opaque tab-scoped continuation identifier |
+| `registration_type` | `string` | Accepted normalized registration type |
+| `masked_destination` | `string` | Safe phone display value |
+| `otp_expires_at` | `Instant` | Five minutes after OTP creation |
+| `resend_after` | `Instant` | Normally 60 seconds; immediate after recorded delivery failure |
+| `session_expires_at` | `Instant` | Pending-registration retention boundary |
+| `delivery_status` | `PENDING \| SENT \| FAILED` | Recorded SMS delivery outcome |
 
-Effects: creates only the User profile. It does not create an Organization,
-Member, Role, API key, or session.
+Effects: creates or reuses server-owned pending-registration and OTP challenge
+state. It creates no User, Organization, Member, Role, API key, or session.
 
+Registration controls:
+
+- OTP expires after five minutes and is stored only as a challenge-scoped
+  HMAC-SHA-256 digest.
+- A sent OTP has a 60-second resend delay; a recorded delivery failure may be
+  retried immediately.
+- Challenge state commits before SMS delivery, and the persisted challenge records
+  the resulting `SENT` or `FAILED` delivery status.
+- Challenge creation takes a PostgreSQL advisory transaction lock before resend
+  checks and replacement writes. Registration locks by phone; login/profile
+  verification locks by purpose plus phone. Replacement invalidates every prior
+  live challenge in that scope.
+- Registration OTP creation/resend is limited to five per phone and 100 per
+  requester IP per 15 minutes.
+- Each OTP allows five verification attempts. Exhaustion sets `OTP_EXHAUSTED`,
+  but the registration remains resumable through resend.
+- Attempt reservation is one conditional atomic update checking consumption,
+  invalidation, expiry, and the maximum-attempt limit while incrementing. The
+  stored digest must satisfy `OCTET_LENGTH(otp_hash) = 32`.
+- Identical normalized pending requests reuse the existing registration after a
+  lost response. A newer materially different attempt for the phone supersedes
+  the older attempt and invalidates its OTP.
+
+```mermaid
+flowchart TD
+A[User opens Register page]
+B[Enter phone email full_name]
+A --> B
+B --> C[Create Registration Session]
+C --> D[Store temporary data server-side]
+D --> E[Send OTP]
+E --> F{OTP correct?}
+F -->|No| G[Retry / expire session]
+F -->|Yes| H[Transaction]
+H --> I[Create or resolve User with password_hash NULL]
+I --> J[Verify phone and consume OTP]
+J --> K[Complete registration and issue first session]
+K --> L[User Active]
+L --> M[Later use dedicated password setup/change]
+```
 Errors: `VALIDATION_FAILED`, `USER_ALREADY_EXISTS`, `REGISTRATION_DISABLED`,
-`TERMS_NOT_ACCEPTED`, `AUDIT_UNAVAILABLE`.
+`TERMS_NOT_ACCEPTED`, `RATE_LIMITED`, `INVITATION_REQUIRED`,
+`INVITATION_INVALID`, `AUDIT_UNAVAILABLE`.
+
+#### Registration continuation operations
+
+`resend_registration_otp(RequestContext, ResendRegistrationOtpInput)` accepts the
+opaque `registration_session_id`, replaces the current challenge when allowed,
+and returns the same registration-session view with the new expiry, resend, and
+delivery metadata. It returns the registration to `OTP_PENDING` after
+`OTP_EXHAUSTED`.
+
+`confirm_registration(RequestContext, ConfirmRegistrationInput)` accepts the
+opaque `registration_session_id` and write-only OTP. A correct current OTP is
+single-use: consumption, User creation/resolution, phone verification,
+registration completion, audit evidence, and first-session issuance commit
+atomically. Wrong attempts are reserved atomically; the fifth failure records
+`OTP_EXHAUSTED` while preserving the registration for resend. The reservation
+update simultaneously rejects consumed, invalidated, expired, and exhausted
+challenges.
+
+Errors include `REGISTRATION_NOT_FOUND`, `REGISTRATION_EXPIRED`,
+`REGISTRATION_SUPERSEDED`, `CHALLENGE_EXPIRED`, `OTP_EXHAUSTED`,
+`VERIFICATION_FAILED`, `RATE_LIMITED`, and `AUDIT_UNAVAILABLE`.
+
+#### Dedicated password setup/change
+
+`change_password(RequestContext, ChangePasswordInput)` is authenticated and is
+the only normal password setup/change boundary. When `password_hash` is `NULL`,
+the User may establish the first password; changing an existing password also
+requires the current password and optimistic User version. Registration never
+accepts a password.
 
 ### 6.2 `login_user`
 
@@ -490,6 +600,8 @@ Authorization: holder of the live challenge plus matching verification proof.
 | `verified_at` | `Instant` |
 
 Effects: consumes the challenge once and sets the matching verification timestamp.
+Consumption explicitly requires `invalidated_at IS NULL` in addition to the
+purpose, User, expiry, and single-use checks.
 
 Errors: `CHALLENGE_NOT_FOUND`, `CHALLENGE_EXPIRED`, `CHALLENGE_CONSUMED`,
 `VERIFICATION_FAILED`, `RATE_LIMITED`, `AUDIT_UNAVAILABLE`.
@@ -505,7 +617,6 @@ Authorization: User self-service or an explicitly authorized administrator.
 | `user_id` | `UserId` | Yes |
 | `expected_version` | `Version` | Yes |
 | `full_name` | `string` | No |
-| `phone` | `string` | No |
 | `email` | `string?` | No |
 | `city_id` | `string?` | No |
 
@@ -514,8 +625,9 @@ Authorization: User self-service or an explicitly authorized administrator.
 | `user` | `UserView` |
 | `verification_required` | `boolean` |
 
-Changing phone or email clears the corresponding verification timestamp and
-requires a new verification challenge.
+Changing email clears its verification timestamp and requires a new verification
+challenge. Phone is read-only here; a future dedicated phone-change operation
+must prove the new phone before mutation.
 
 Errors: `USER_NOT_FOUND`, `FORBIDDEN`, `VALIDATION_FAILED`,
 `VERSION_CONFLICT`, `AUDIT_UNAVAILABLE`.

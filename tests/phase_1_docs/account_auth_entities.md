@@ -1,7 +1,16 @@
 # ARK entities
 
+Physical PostgreSQL schema, table, column, index, and constraint identifiers use
+lowercase snake_case in the target contract. PascalCase database identifiers are
+legacy implementation state pending a coordinated forward migration.
+
 Related application-service contract:
 `tests/phase_1_docs/account_organization_function_contract.md`.
+
+Current registration implementation evidence:
+`sources/sponsor-decisions/2026-08-23-account-registration-redesign-implementation.md`
+and its concurrency hardening addendum at
+`sources/sponsor-decisions/2026-08-23-account-otp-concurrency-hardening.md`.
 
 The current identity and access entities are `Users`, `Organizations`, `Roles`,
 `Permissions`, `Members`, and `APIKeys`. `AuditEvents` records immutable security
@@ -20,9 +29,11 @@ and business effects.
 9. Build a trusted request context; request fields never create organization or business authority.
 10. Append the required audit event before any high-impact effect.
 
-## IAM schema
+## Account schema
 
-IAM owns Users, the system-managed Role/Permission catalog, and API-key hashes.
+Account (the module formerly called IAM) owns Users, temporary registration state,
+authentication sessions and challenges, the system-managed Role/Permission catalog,
+and API-key hashes.
 The Organizations schema owns Organizations, Members, and Businesses. Each Member
 has exactly one Role and exactly one current API key. Revoked predecessors are
 retained only as rotation history. Every active Member can address every current
@@ -55,7 +66,7 @@ CREATE TABLE account.users (
     password_changed_at TIMESTAMPTZ,
     last_login_at TIMESTAMPTZ,
     disabled_at TIMESTAMPTZ,
-    deleted_at TIMESTAMPTZ
+    deleted_at TIMESTAMPTZ,
 
     CONSTRAINT chk_users_name
         CHECK (LENGTH(BTRIM(full_name)) > 0),
@@ -94,9 +105,35 @@ CREATE TABLE account.user_profiles (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()    
 );
 
+CREATE TABLE account.registration_sessions (
+    registration_session_id UUID PRIMARY KEY,
+    registration_type VARCHAR(30) NOT NULL,
+    phone VARCHAR(11) NOT NULL,
+    full_name VARCHAR(200) NOT NULL,
+    email VARCHAR(320),
+    city_id VARCHAR(100),
+    terms_version VARCHAR(100),
+    invitation_id UUID,
+    existing_user_id UUID REFERENCES account.users(id),
+    status VARCHAR(30) NOT NULL,
+    request_fingerprint CHAR(64) NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    current_challenge_id UUID,
+    completed_user_id UUID REFERENCES account.users(id),
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT chk_registration_type
+        CHECK (registration_type IN ('NEW_OWNER', 'INVITED_MEMBER')),
+    CONSTRAINT chk_registration_status
+        CHECK (status IN ('OTP_PENDING', 'OTP_EXHAUSTED', 'COMPLETED', 'SUPERSEDED', 'EXPIRED'))
+);
+
 CREATE TABLE account.otp_challenges (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID,
+    registration_session_id UUID REFERENCES account.registration_sessions(registration_session_id),
     phone VARCHAR(32) NOT NULL,
     purpose VARCHAR(30) NOT NULL,
     -- LOGIN
@@ -105,11 +142,55 @@ CREATE TABLE account.otp_challenges (
 
     otp_hash BYTEA NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL,
+    resend_after TIMESTAMPTZ NOT NULL,
     consumed_at TIMESTAMPTZ,
+    invalidated_at TIMESTAMPTZ,
     attempt_count INT NOT NULL DEFAULT 0,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    max_attempts INT NOT NULL,
+    delivery_status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    delivery_attempt_count INT NOT NULL DEFAULT 0,
+    last_delivery_attempt_at TIMESTAMPTZ,
+    requester_ip_hash BYTEA,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT chk_otp_hash_length
+        CHECK (OCTET_LENGTH(otp_hash) = 32)
 );
 ```
+
+### Registration lifecycle and controls
+
+- Registration validates and normalizes full name, Iranian phone, optional email,
+  city, registration type, and invitation fields. It accepts no password.
+- Account persists authoritative pending-registration data; the browser retains
+  only an opaque tab-scoped registration-session ID.
+- No User exists until a valid OTP is consumed. Activation creates or resolves the
+  User, verifies the phone, consumes the OTP, completes the registration, records
+  audit evidence, and issues the first session in one transaction.
+- An identical pending request is reusable after a lost response. A newer attempt
+  for the same phone supersedes the older registration and invalidates its OTP.
+- Failed SMS delivery is recorded without abandoning the pending registration.
+  The failed delivery may be retried immediately; a recorded send has a 60-second
+  resend delay.
+- Challenge state commits before SMS delivery. Challenge creation is serialized
+  with a PostgreSQL advisory transaction lock before resend eligibility and
+  replacement writes. Registration locks by phone; login/profile verification
+  locks by purpose plus phone.
+- Replacing a challenge invalidates every previous unconsumed, non-invalidated
+  code in the same scope before inserting the successor.
+- OTP lifetime is five minutes. Only a challenge-scoped HMAC-SHA-256 digest is
+  stored, and PostgreSQL requires the digest to be exactly 32 bytes. Five failed
+  attempts set `OTP_EXHAUSTED`; a resend creates a fresh OTP and returns the
+  registration to `OTP_PENDING`.
+- Attempt reservation is one atomic conditional update that increments only when
+  the challenge is unconsumed, not invalidated, unexpired, and below its maximum.
+  Login/profile consumption explicitly repeats the live-challenge checks.
+- Registration OTP creation/resend is limited to five per phone and 100 per
+  requester IP in a 15-minute window.
+- New Users have `password_hash = NULL` until the authenticated Account password
+  setup/change operation succeeds. Normal profile editing cannot change phone.
+- Expired and terminal temporary registration records are cleaned up under the
+  Account retention policy.
 
 ### `roles`, `permissions`, and `role_permissions`
 
@@ -120,7 +201,7 @@ new Role version; it does not silently change the meaning of a Role already
 referenced by a Member.
 
 ```sql
-CREATE TABLE iam.roles (
+CREATE TABLE account.roles (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     role_code VARCHAR(100) NOT NULL,
     name VARCHAR(200) NOT NULL,
@@ -152,10 +233,10 @@ CREATE TABLE iam.roles (
 );
 
 CREATE UNIQUE INDEX uq_roles_one_active_version
-    ON iam.roles (role_code)
+    ON account.roles (role_code)
     WHERE status = 'ACTIVE';
 
-CREATE TABLE iam.permissions (
+CREATE TABLE account.permissions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     permission_code VARCHAR(150) NOT NULL,
     description VARCHAR(500) NOT NULL,
@@ -187,10 +268,10 @@ CREATE TABLE iam.permissions (
 );
 
 CREATE UNIQUE INDEX uq_permissions_one_active_version
-    ON iam.permissions (permission_code)
+    ON account.permissions (permission_code)
     WHERE status = 'ACTIVE';
 
-CREATE TABLE iam.role_permissions (
+CREATE TABLE account.role_permissions (
     role_id UUID NOT NULL,
     permission_id UUID NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -199,12 +280,12 @@ CREATE TABLE iam.role_permissions (
 
     CONSTRAINT fk_role_permissions_role
         FOREIGN KEY (role_id)
-        REFERENCES iam.roles (id)
+        REFERENCES account.roles (id)
         ON DELETE RESTRICT,
 
     CONSTRAINT fk_role_permissions_permission
         FOREIGN KEY (permission_id)
-        REFERENCES iam.permissions (id)
+        REFERENCES account.permissions (id)
         ON DELETE RESTRICT
 );
 ```
@@ -238,7 +319,7 @@ CREATE TABLE organizations.organizations (
 
     CONSTRAINT fk_organizations_created_by_user
         FOREIGN KEY (created_by_user_id)
-        REFERENCES iam.users (id)
+        REFERENCES account.users (id)
         ON DELETE RESTRICT,
 
     CONSTRAINT chk_organizations_name
@@ -283,7 +364,7 @@ CREATE TABLE organizations.members (
 
     CONSTRAINT fk_members_user
         FOREIGN KEY (user_id)
-        REFERENCES iam.users (id)
+        REFERENCES account.users (id)
         ON DELETE RESTRICT,
 
     CONSTRAINT fk_members_organization
@@ -293,7 +374,7 @@ CREATE TABLE organizations.members (
 
     CONSTRAINT fk_members_role
         FOREIGN KEY (role_id)
-        REFERENCES iam.roles (id)
+        REFERENCES account.roles (id)
         ON DELETE RESTRICT,
 
     -- A User can join many Organizations, but only once per Organization.
@@ -341,52 +422,52 @@ CREATE INDEX ix_members_organization_status
 ### `businesses`
 
 ```sql
-CREATE TABLE "Businesses" (
-    "Id" bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-    "PublicId" uuid NOT NULL DEFAULT gen_random_uuid(), -- Use this identifier in APIs if Id remains a sequential bigint.
-    "OrganizationId" bigint NOT NULL,
-    "Name" varchar(100) NOT NULL,
-    "Description" varchar(1000),
-    "Type" integer NOT NULL, -- Must reference a system-managed catalog or have a CHECK constraint.
-    "Status" integer NOT NULL DEFAULT 1, -- 1 = ACTIVE, 2 = SUSPENDED, 3 = CLOSED
-    "ExternalRef" varchar(200),
-    "CreatedAt" timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "UpdatedAt" timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "StatusChangedAt" timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "Version" bigint NOT NULL DEFAULT 1,
+CREATE TABLE organizations.businesses (
+    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    public_id uuid NOT NULL DEFAULT gen_random_uuid(), -- Use this identifier in APIs if id remains a sequential bigint.
+    organization_id bigint NOT NULL,
+    name varchar(100) NOT NULL,
+    description varchar(1000),
+    type integer NOT NULL, -- Must reference a system-managed catalog or have a CHECK constraint.
+    status integer NOT NULL DEFAULT 1, -- 1 = ACTIVE, 2 = SUSPENDED, 3 = CLOSED
+    external_ref varchar(200),
+    created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    status_changed_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    version bigint NOT NULL DEFAULT 1,
 
-    CONSTRAINT "FK_Businesses_Organizations"
-        FOREIGN KEY ("OrganizationId")
-        REFERENCES "Organizations" ("Id")
+    CONSTRAINT fk_businesses_organizations
+        FOREIGN KEY (organization_id)
+        REFERENCES organizations.organizations (id)
         ON DELETE RESTRICT,
 
-    CONSTRAINT "UQ_Businesses_PublicId"
-        UNIQUE ("PublicId"),
+    CONSTRAINT uq_businesses_public_id
+        UNIQUE (public_id),
 
     -- Allows downstream records to enforce that a Business belongs
     -- to the supplied Organization.
-    CONSTRAINT "UQ_Businesses_Id_OrganizationId"
-        UNIQUE ("Id", "OrganizationId"),
+    CONSTRAINT uq_businesses_id_organization_id
+        UNIQUE (id, organization_id),
 
-    CONSTRAINT "CK_Businesses_Name"
-        CHECK (length(btrim("Name")) > 0),
+    CONSTRAINT ck_businesses_name
+        CHECK (length(btrim(name)) > 0),
 
-    CONSTRAINT "CK_Businesses_Type"
-        CHECK ("Type" > 0),
+    CONSTRAINT ck_businesses_type
+        CHECK (type > 0),
 
-    CONSTRAINT "CK_Businesses_Status"
-        CHECK ("Status" IN (1, 2, 3)),
+    CONSTRAINT ck_businesses_status
+        CHECK (status IN (1, 2, 3)),
 
-    CONSTRAINT "CK_Businesses_Version"
-        CHECK ("Version" >= 1)
+    CONSTRAINT ck_businesses_version
+        CHECK (version >= 1)
 );
 
-CREATE INDEX "IX_Businesses_OrganizationId_Status"
-    ON "Businesses" ("OrganizationId", "Status");
+CREATE INDEX ix_businesses_organization_id_status
+    ON organizations.businesses (organization_id, status);
 
-CREATE UNIQUE INDEX "UQ_Businesses_OrganizationId_ExternalRef"
-    ON "Businesses" ("OrganizationId", "ExternalRef")
-    WHERE "ExternalRef" IS NOT NULL;
+CREATE UNIQUE INDEX uq_businesses_organization_id_external_ref
+    ON organizations.businesses (organization_id, external_ref)
+    WHERE external_ref IS NOT NULL;
 ```
 
 ### `api_keys`
@@ -464,18 +545,18 @@ CREATE TABLE account.api_keys (
 );
 
 CREATE UNIQUE INDEX uq_api_keys_single_rotation_successor
-    ON iam.api_keys (rotated_from_api_key_id)
+    ON account.api_keys (rotated_from_api_key_id)
     WHERE rotated_from_api_key_id IS NOT NULL;
 
 CREATE UNIQUE INDEX uq_api_keys_one_active_per_member
-    ON iam.api_keys (member_id)
+    ON account.api_keys (member_id)
     WHERE status = 'active';
 
 CREATE INDEX ix_api_keys_member_status
-    ON iam.api_keys (member_id, status);
+    ON account.api_keys (member_id, status);
 
 CREATE INDEX ix_api_keys_organization_status
-    ON iam.api_keys (organization_id, status);
+    ON account.api_keys (organization_id, status);
 ```
 
 The partial unique index enforces at most one active API-key row per Member. The
@@ -819,7 +900,7 @@ Older revoked API-key rows may remain only as rotation history.
 
 
 # Notes
--- Users, Roles, Permissions and API-key hashes are owned by IAM.
+-- Users, registration/authentication state, Roles, Permissions, and API-key hashes are owned by Account.
 -- Organizations, Members and Businesses are owned by the Organizations module.
 -- Cross-schema foreign keys shown here protect the initial modular-monolith database;
 -- a future service extraction must replace them with explicit public contracts.
@@ -829,4 +910,4 @@ Older revoked API-key rows may remain only as rotation history.
 
 -- Runtime grants are intentionally absent. Deployment must create narrowly
 -- scoped LOGIN/NOLOGIN roles, transfer schema ownership as approved, and grant
--- only the IAM module writer/reader privileges for that environment.
+-- only the Account module writer/reader privileges for that environment.
